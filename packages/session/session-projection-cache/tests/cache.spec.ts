@@ -293,6 +293,27 @@ describe('SessionProjectionCache write policy', () => {
     expect(write).toHaveBeenCalledExactlyOnceWith(session)
   })
 
+  it('writes a dirty in-turn checkpoint on the interval and a cold read serves the persisted cut', async () => {
+    const { ctx, root, cache } = await harness({ config: { writeEveryEvents: 1000, writeIntervalMs: 20 } })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const id = SessionId('in-turn-interval')
+    const created = whenWritten(ctx, id)
+    const session = ctx.sessions.create(id)
+    const event = mark(session, ['live'])
+    await created
+    expect((await storedRows(root, id))?.['cache-test/marks']?.seq).toBe(-1) // the creation cut predates the mark
+    const written = whenWritten(ctx, id)
+    await vi.advanceTimersByTimeAsync(20)
+    await written
+    expect((await storedRows(root, id))?.['cache-test/marks'])
+      .toEqual({ ver: 1, seq: event.seq, val: { marks: ['live'] } })
+    // The cold read holds the session's own identity, so the persisted row
+    // seeds the fold and the log tail at or below the watermark is not refolded.
+    const cold = cache.coldSnapshot(session.header, session.inheritedEventCount, [event])
+    expect(cold.asOfSeq).toBe(event.seq)
+    expect(cold.values['cache-test/marks']).toEqual({ marks: ['live'] })
+  })
+
   it('write() on a never-dirty session checkpoints directly and rejects a non-JSON unit state', async () => {
     const { ctx, root } = await harness()
     // Never dirtied: no events — write() still lands the init-derived cut.
