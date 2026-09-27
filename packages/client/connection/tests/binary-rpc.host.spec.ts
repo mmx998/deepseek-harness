@@ -184,6 +184,60 @@ describe('Connection binary RPC', () => {
     await expect(rpc.call('/api', 'fixture/read', {})).rejects.toThrow('rpcId mismatch')
   })
 
+  it('retries once with a fresh rpcId when the first response names another request', async () => {
+    let calls = 0
+    const rpc = createWebConnectionRpc(async (_url, init) => {
+      const message = JSON.parse(init.body as string) as { rpcId: string }
+      calls += 1
+      if (calls === 1) return Response.json({ type: 'server-response', rpcId: 'stale-rpc', result: { ok: true, value: null } })
+      return Response.json({ type: 'server-response', rpcId: message.rpcId, result: { ok: true, value: 'fresh' } })
+    })
+    await expect(rpc.call('/api', 'fixture/read', {})).resolves.toEqual({ ok: true, value: 'fresh' })
+    expect(calls).toBe(2)
+  })
+
+  it('surfaces the mismatch when the retry also answers another request', async () => {
+    const sent: string[] = []
+    const rpc = createWebConnectionRpc(async (_url, init) => {
+      const message = JSON.parse(init.body as string) as { rpcId: string }
+      sent.push(message.rpcId)
+      return Response.json({ type: 'server-response', rpcId: 'stale-rpc', result: { ok: true, value: null } })
+    })
+    await expect(rpc.call('/api', 'fixture/read', {}))
+      .rejects.toThrow(/^rpcId mismatch for fixture\/read: sent [0-9a-f-]+, got stale-rpc \(attempt 3\/3, unrecognized response body\)$/)
+    expect(sent).toHaveLength(3)
+    expect(sent[0]).not.toBe(sent[1])
+  })
+
+  it('posts each attempt to a route query unique to its rpcId', async () => {
+    const calls: Array<{ url: string; rpcId: string }> = []
+    const rpc = createWebConnectionRpc(async (url, init) => {
+      const message = JSON.parse(init.body as string) as { rpcId: string }
+      calls.push({ url: String(url), rpcId: message.rpcId })
+      if (calls.length === 1) return Response.json({ type: 'server-response', rpcId: 'stale-rpc', result: { ok: true, value: null } })
+      return Response.json({ type: 'server-response', rpcId: message.rpcId, result: { ok: true, value: 'fresh' } })
+    })
+    await expect(rpc.call('/api', 'fixture/read', {})).resolves.toEqual({ ok: true, value: 'fresh' })
+    expect(calls).toHaveLength(2)
+    for (const call of calls) expect(call.url).toBe(`api/fixture/read?rpcId=${call.rpcId}`)
+    expect(calls[0]?.rpcId).not.toBe(calls[1]?.rpcId)
+  })
+
+  it('attributes a surfaced mismatch to a replay when the foreign rpcId was sent before', async () => {
+    let replayed = ''
+    const rpc = createWebConnectionRpc(async (_url, init) => {
+      const message = JSON.parse(init.body as string) as { rpcId: string }
+      if (replayed === '') {
+        replayed = message.rpcId
+        return Response.json({ type: 'server-response', rpcId: message.rpcId, result: { ok: true, value: 'first' } })
+      }
+      return Response.json({ type: 'server-response', rpcId: replayed, result: { ok: true, value: null } })
+    })
+    await expect(rpc.call('/api', 'fixture/read', {})).resolves.toEqual({ ok: true, value: 'first' })
+    await expect(rpc.call('/api', 'fixture/read', {}))
+      .rejects.toThrow(/\(attempt 3\/3, stale replay of an earlier request\)$/)
+  })
+
   it('roundtrips nested, optional and root attachment paths without reserving field names', async () => {
     const ctx = new Context()
     const fiber = ctx.plugin((owner) => { new HostConnectionService(owner, [], {} as BrowserAuth) })

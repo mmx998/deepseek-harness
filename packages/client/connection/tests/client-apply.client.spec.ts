@@ -469,7 +469,7 @@ describe('connection client apply', () => {
       vi.unstubAllGlobals()
     }
     expect(seen).toHaveLength(1)
-    expect(seen[0]?.url).toBe('api/goals/create')
+    expect(seen[0]?.url).toBe('api/goals/create?rpcId=00000000-0000-4000-8000-000000000000')
     expect(seen[0]?.body).toMatchObject({
       type: 'client-request',
       rpcId: '00000000-0000-4000-8000-000000000000',
@@ -549,19 +549,22 @@ describe('connection client apply', () => {
       await expect(handle.rpc.call('/api', 'goals/create', {}, abort.signal))
         .rejects.toThrow('HTTP 503')
       expect(globalThis.fetch).toHaveBeenCalledWith(
-        'api/goals/create',
+        expect.stringMatching(/^api\/goals\/create\?rpcId=[0-9a-f-]+$/),
         expect.objectContaining({ signal: abort.signal }),
       )
 
       ;(globalThis as Win).location = { hostname: 'localhost', origin: 'null' }
-      globalThis.fetch = vi.fn().mockResolvedValue(Response.json({
+      // A mismatched envelope names another request, so the caller retries with
+      // fresh rpcIds; each mock call must hand back a fresh Response body.
+      globalThis.fetch = vi.fn().mockImplementation(async () => Response.json({
         type: 'server-response',
         rpcId: 'different-rpc',
         result: { ok: true, value: null },
       }))
       await expect(handle.rpc.call('/api', 'goals/create', {})).rejects.toThrow('rpcId mismatch')
       const fetch = vi.mocked(globalThis.fetch)
-      expect(fetch.mock.calls[0]?.[0]).toEqual('api/goals/create')
+      expect(fetch).toHaveBeenCalledTimes(3)
+      expect(fetch.mock.calls[0]?.[0]).toMatch(/^api\/goals\/create\?rpcId=[0-9a-f-]+$/)
       expect(fetch.mock.calls[0]?.[1]).not.toHaveProperty('signal')
 
       const respond = (result: unknown): void => {

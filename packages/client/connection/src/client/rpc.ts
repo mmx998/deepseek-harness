@@ -11,6 +11,9 @@ import { randomUuid } from './random-uuid.ts'
 const CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/
 const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
 
+/** Sent rpcIds remembered per caller, so a mismatching response can be attributed to a replayed earlier request. */
+const RECENT_SENT_RPC_IDS = 32
+
 /**
  * Transport this caller posts through; same signature as the global `fetch`.
  * Receives the document-relative route so a carrier resolves it against its own base.
@@ -26,6 +29,19 @@ export type RpcStreamOpen = (
 ) => AsyncIterable<unknown>
 
 /**
+ * The response envelope named another request's rpcId, so its payload cannot be trusted for this call.
+ * `staleReplay` records whether the foreign rpcId belongs to one of this caller's own recent
+ * requests — the signature of a cached or replayed body — or to an unrecognized source. `attempt`
+ * counts the surfaced call's attempts, so a reported error also identifies the running build.
+ */
+class RpcIdMismatchError extends Error {
+  constructor(endpoint: string, sent: string, got: string, staleReplay: boolean, attempt: number) {
+    super(`rpcId mismatch for ${endpoint}: sent ${sent}, got ${got} (attempt ${attempt}/3, ${staleReplay ? 'stale replay of an earlier request' : 'unrecognized response body'})`)
+    this.name = 'RpcIdMismatchError'
+  }
+}
+
+/**
  * Create the browser-backed generic RPC caller.
  * @param doFetch - transport override; defaults to the page's global fetch.
  * @param openStream - optional worker-local Gateway stream carrier.
@@ -33,40 +49,66 @@ export type RpcStreamOpen = (
  */
 export function createWebConnectionRpc(doFetch?: RpcFetch, openStream?: RpcStreamOpen): ClientConnectionRpc {
   const send: RpcFetch = doFetch ?? ((input, init) => globalThis.fetch(input, init))
+  const sentRpcIds: RpcIdType[] = []
   return {
     async call(channel, endpoint, payload, signal) {
       assertTarget(channel, endpoint)
-      const rpcId = RpcId(randomUuid())
-      const message: ClientRequest = {
-        type: 'client-request',
-        rpcId,
-        method: endpoint,
-        payload,
-      }
       // The channel key is absolute; a page posts the document-relative form, and
       // a carrier that resolves against the Host root accepts the same form.
       const route = `${channel}/${endpoint}`.slice(1)
-      const response = await send(
-        route,
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(message),
-          ...signal === undefined ? {} : { signal },
-        },
-      )
-      if (!response.ok) {
-        throw new Error(`transport failure for ${channel}/${endpoint}: HTTP ${response.status}`)
+      const attempt = async (attemptNo: number): Promise<ConnectionRpcResult<unknown>> => {
+        const rpcId = RpcId(randomUuid())
+        sentRpcIds.push(rpcId)
+        if (sentRpcIds.length > RECENT_SENT_RPC_IDS) sentRpcIds.shift()
+        const message: ClientRequest = {
+          type: 'client-request',
+          rpcId,
+          method: endpoint,
+          payload,
+        }
+        // A per-attempt unique route query keeps any URL-keyed cache or replay
+        // between the page and the Host from serving another call's body; the
+        // Host resolves the endpoint from the path alone.
+        const response = await send(
+          `${route}?rpcId=${rpcId}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(message),
+            ...signal === undefined ? {} : { signal },
+          },
+        )
+        if (!response.ok) {
+          throw new Error(`transport failure for ${channel}/${endpoint}: HTTP ${response.status}`)
+        }
+        const mediaType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+        const full = mediaType === 'multipart/form-data'
+          ? await parseBinaryResponse(response)
+          : parseConnectionResponse(await response.json())
+        signal?.throwIfAborted()
+        if (full.rpcId !== rpcId) {
+          throw new RpcIdMismatchError(endpoint, rpcId, full.rpcId, sentRpcIds.includes(full.rpcId), attemptNo)
+        }
+        return full.result
       }
-      const mediaType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
-      const full = mediaType === 'multipart/form-data'
-        ? await parseBinaryResponse(response)
-        : parseConnectionResponse(await response.json())
-      signal?.throwIfAborted()
-      if (full.rpcId !== rpcId) {
-        throw new Error(`rpcId mismatch for ${endpoint}: sent ${rpcId}, got ${full.rpcId}`)
+      const maxMismatchRetries = 2
+      for (let retry = 0; ; retry++) {
+        try {
+          return await attempt(retry + 1)
+        } catch (error) {
+          // A mismatching response was crossed or replayed by an instrumenting
+          // layer between the page and the Host (fetch-wrapping shell, browser
+          // injection, or embedded-browser instrumentation) outside any URL
+          // key. The call itself was unaffected, so fresh-id retries with a
+          // short delay outlast the crossing window; a final mismatch surfaces
+          // with its replay attribution. An aborted call re-enters the attempt
+          // and fails on its signal there.
+          if (!(error instanceof RpcIdMismatchError) || retry >= maxMismatchRetries) throw error
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 30 * (retry + 1))
+          })
+        }
       }
-      return full.result
     },
     ...openStream === undefined ? {} : {
       open(channel, endpoint, payload, signal, uplink) {
