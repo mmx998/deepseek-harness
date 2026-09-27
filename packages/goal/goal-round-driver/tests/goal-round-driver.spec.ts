@@ -243,15 +243,20 @@ describe('same-session goal driving', () => {
     ['rate limit', new LlmError('slow down', 'RATE_LIMIT')],
     ['request error', new Error('provider broke')],
     ['max tokens', maxTokensResponse('unfinished')],
-  ] as const)('disarms automatic continuation after a %s', async (_label, response) => {
-    const test = await harness([response])
-    test.ctx.goals.create(test.agent, { objective: 'stop safely', maxGoalRounds: 8 })
+  ] as const)('continues automatic continuation after a %s', async (_label, response) => {
+    const test = await harness([response, textResponse('round two')])
+    test.ctx.goals.create(test.agent, { objective: 'continue through failures', maxGoalRounds: 2 })
 
-    const goal = await waitForGoal(test.ctx, test.agent, current =>
-      current?.phase === 'active' && current.activation === 'disarmed')
+    const goal = await waitForGoal(test.ctx, test.agent, current => current?.phase === 'blocked')
 
-    expect(goal).toMatchObject({ roundsStarted: 1, activation: 'disarmed' })
-    expect(test.adapter.requests).toHaveLength(1)
+    // The failed first round stays admitted and the driver starts round two,
+    // which runs to the cap and records the round-limit blocker.
+    expect(goal).toMatchObject({ roundsStarted: 2, activation: 'disarmed' })
+    expect(goal?.blockedReason).toEqual({
+      code: 'round-limit',
+      message: 'Goal reached its configured limit of 2 rounds.',
+    })
+    expect(test.adapter.requests).toHaveLength(2)
   })
 
   it('maps a downstream step rejection to blocked without entering the round', async () => {
@@ -1009,7 +1014,7 @@ describe('same-session goal driving', () => {
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('goal-round-driver'))
   })
 
-  it('keeps terminal agent failure disarmed and defers queued human work until another wakeup', async () => {
+  it('continues past a failed round to the cap and defers queued human work until another wakeup', async () => {
     const test = await harness([new Error('round one broke'), textResponse('human answer')])
     let queued = false
     test.ctx.on('session/event', (session, event) => {
@@ -1023,8 +1028,10 @@ describe('same-session goal driving', () => {
     })
     test.ctx.goals.create(test.agent, { objective: 'survive a stale failure', maxGoalRounds: 1 })
 
+    // The failed round stays admitted, so the next drive pass records the
+    // round-limit blocker instead of disarming silently.
     await waitForGoal(test.ctx, test.agent, current =>
-      current?.phase === 'active' && current.activation === 'disarmed')
+      current?.phase === 'blocked' && current.activation === 'disarmed')
 
     expect(test.adapter.requests).toHaveLength(1)
     expect(test.agent.inbox.nextTurn).toHaveLength(1)

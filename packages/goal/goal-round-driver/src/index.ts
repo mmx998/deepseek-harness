@@ -43,6 +43,8 @@ interface DriverState {
   requested: boolean
   run: Promise<void> | undefined
   stopping: boolean
+  /** Turn of an `agent/error` whose `turn/end` close has not been observed yet. */
+  unobservedErrorTurn: number | undefined
 }
 
 /** Whether a source identifies an automatic, positive-numbered goal round. */
@@ -88,6 +90,7 @@ export function apply(ctx: Context): void {
       requested: false,
       run: undefined,
       stopping: false,
+      unobservedErrorTurn: undefined,
     }
     states.set(agent, state)
     return state
@@ -243,9 +246,12 @@ export function apply(ctx: Context): void {
   // One composite effect keeps the step fence installed until this
   // plugin's own scheduling tasks settle.
   ctx.effect(function* () {
-    ctx.on('agent/error', ({ agent }) => {
-      const state = stateFor(agent)
-      disarm(state)
+    ctx.on('agent/error', ({ agent, turn }) => {
+      // The agent emits this before the failing turn's own `turn/end` close.
+      // A closed turn keeps the failure in the log, so the goal stays armed
+      // and continuation resumes at the idle edge; a close that never lands
+      // means the log write failed, and that fence resolves at idle.
+      stateFor(agent).unobservedErrorTurn = turn
     })
 
     ctx.on('agent/disposed', ({ agent }) => { states.delete(agent) })
@@ -254,11 +260,19 @@ export function apply(ctx: Context): void {
       state.attempt = undefined
       state.competingQueued = false
       state.needsCheckpoint = false
+      state.unobservedErrorTurn = undefined
     })
     ctx.on('agent/status', ({ agent, status }) => {
       const state = stateFor(agent)
       if (status === 'idle') {
         state.competingQueued = false
+        // The errored turn never closed, so its log write failed: stop instead
+        // of scheduling another round against a session whose tail is not durable.
+        if (state.unobservedErrorTurn !== undefined) {
+          state.unobservedErrorTurn = undefined
+          disarm(state)
+          return
+        }
         const attempt = state.attempt
         const goal = currentGoal(state)
         // Fence the pause to the exact dropped attempt's ref. A resume bumps
@@ -326,10 +340,10 @@ export function apply(ctx: Context): void {
           }
           return
         case 'turn/end':
-          if (event.data.reason.kind === 'max-tokens') {
-            disarm(state)
-            return
-          }
+          // The turn closed with its failure recorded in the log: model- and
+          // provider-level failures (parse errors, rate limits, request
+          // errors, max tokens) keep the goal armed and continue at idle.
+          if (event.data.turn === state.unobservedErrorTurn) state.unobservedErrorTurn = undefined
           if (event.data.reason.kind !== 'aborted') return
           if (state.attempt?.phase === 'claimed' || state.attempt?.phase === 'admitted') {
             state.attempt.cancelled = true
@@ -385,10 +399,11 @@ export function apply(ctx: Context): void {
         decision = await next()
       } catch (error: unknown) {
         if (signal.aborted) throw error
-        // A throwing downstream hook drops the whole step proposal. Clear the
-        // reservation before the balanced no-step turn returns to idle so the
-        // next drive pass can reschedule the round.
+        // A throwing downstream hook drops the whole step proposal. That is a
+        // harness plugin failure, not a provider interruption: fail closed
+        // instead of rescheduling the round.
         state.attempt = undefined
+        disarm(state)
         requestDrive(state)
         throw error
       }
